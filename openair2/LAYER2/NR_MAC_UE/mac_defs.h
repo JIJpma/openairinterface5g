@@ -514,6 +514,26 @@ typedef struct {
   A_SEQUENCE_OF(si_schedinfo_config_t) si_SchedInfo_list;
 } si_schedInfo_t;
 
+/*!\brief v1 adversarial-UE profile (simulation experiments only).
+ * All fields default to 0/off, so a build with this compiled in but the
+ * [adversary] config section absent behaves exactly like a stock UE.
+ * Populated from config by nr_ue_read_adversary_config() (nr_ue_adversary.c).
+ * Fields are int (not bool) to map directly onto the OAI config paramdef. */
+typedef struct nr_ue_adversary_s {
+  int enabled; // master switch for all adversarial behaviour
+  // BSR inflation: report a falsely large UL buffer to the gNB
+  int bsr_inflate; // 1 = inflate reported buffer occupancy
+  int bsr_min_bytes; // floor (bytes) claimed per active LCG when inflating
+  // SR flooding: keep a scheduling request permanently pending
+  int sr_flood; // 1 = never let the pending SR be cancelled
+  // RACH flooding: periodically force a new Random Access procedure
+  int rach_flood; // 1 = re-trigger RA on a fixed period
+  int rach_period_frames; // RA re-trigger period in frames (when rach_flood)
+  // attack active window (SFN), lets a run capture clean before/during/after
+  int start_frame; // attack inactive while frame < start_frame
+  int stop_frame; // attack inactive while frame > stop_frame; <=0 => no upper bound
+} nr_ue_adversary_t;
+
 /*!\brief Top level UE MAC structure */
 typedef struct NR_UE_MAC_INST_s {
   module_id_t ue_id;
@@ -620,6 +640,8 @@ typedef struct NR_UE_MAC_INST_s {
   // set when mac configuration changes during reconf with sync
   // reset when pdcch config is changed after pbch read after reconf
   bool update_pdcch_config;
+  // v1 adversarial-UE profile (simulation experiments); all-off by default
+  nr_ue_adversary_t adversary;
 } NR_UE_MAC_INST_t;
 
 static inline int GET_NTN_UE_K_OFFSET(const fapi_nr_ntn_config_t *ntn_ta, int scs)

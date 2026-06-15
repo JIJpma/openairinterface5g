@@ -4,6 +4,7 @@
 
 //#include "defs.h"
 #include "mac_proto.h"
+#include "nr_ue_adversary.h"
 #include "radio/COMMON/common_lib.h"
 #include "assertions.h"
 #include "executables/nr-uesoftmodem.h"
@@ -112,6 +113,8 @@ NR_UE_MAC_INST_t *nr_l2_init_ue(int instance_id, int numerology)
   mac->ue_id = instance_id;
   mac->numerology = numerology;
   nr_ue_init_mac(mac);
+  // v1 adversarial-UE profile (simulation only); no-op unless [adversary] is set
+  nr_ue_read_adversary_config(&mac->adversary);
   int ret = pthread_mutex_init(&mac->if_mutex, NULL);
   AssertFatal(ret == 0, "Mutex init failed\n");
   nr_ue_mac_default_configs(mac);
