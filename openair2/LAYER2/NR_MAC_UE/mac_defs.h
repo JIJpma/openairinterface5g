@@ -532,6 +532,9 @@ typedef struct nr_ue_adversary_s {
   // attack active window (SFN), lets a run capture clean before/during/after
   int start_frame; // attack inactive while frame < start_frame
   int stop_frame; // attack inactive while frame > stop_frame; <=0 => no upper bound
+  // observability (independent of enabled/window): log every UL grant, not the
+  // 128-frame average, so per-TB RB/symbol allocation is visible during a run
+  int log_grants; // 1 = log per-UL-grant rb_size/nr_of_symbols/TBS as they occur
 } nr_ue_adversary_t;
 
 /*!\brief Top level UE MAC structure */

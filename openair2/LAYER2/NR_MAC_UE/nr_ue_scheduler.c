@@ -852,6 +852,26 @@ int nr_config_pusch_pdu(NR_UE_MAC_INST_t *mac,
   mac->stats.ul.rb_size += pusch_config_pdu->rb_size;
   mac->stats.ul.nr_of_symbols += pusch_config_pdu->nr_of_symbols;
 
+  // Per-UL-grant trace (opt-in via --adversary.log_grants): the print_ue_mac_stats
+  // line reports rb_size/nr_of_symbols averaged over a 128-frame window, which
+  // hides the instantaneous allocation. This logs the true per-TB values as each
+  // grant is configured, so BSR-inflation effects (grants pinned to the full BWP)
+  // are directly visible. Independent of the attack enable/window on purpose.
+  if (mac->adversary.log_grants)
+    LOG_I(NR_MAC,
+          "UE %d RNTI %04x UL grant per-TB: rb_start %d, nb RBs %d, nb symbols %d, start_symbol %d, "
+          "TBS %d B, mcs %d, round %d, harq pid %d\n",
+          mac->ue_id,
+          mac->crnti,
+          pusch_config_pdu->rb_start,
+          pusch_config_pdu->rb_size,
+          pusch_config_pdu->nr_of_symbols,
+          pusch_config_pdu->start_symbol_index,
+          pusch_config_pdu->pusch_data.tb_size,
+          pusch_config_pdu->mcs_index,
+          mac->ul_harq_info[pid].round,
+          pid);
+
   return 0;
 }
 

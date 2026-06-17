@@ -26,6 +26,7 @@
 #define ADV_RACH_PERIOD  "rach_period_frames"
 #define ADV_START_FRAME  "start_frame"
 #define ADV_STOP_FRAME   "stop_frame"
+#define ADV_LOG_GRANTS   "log_grants"
 
 /* default claimed buffer: ~150 kB sits near the top of the BSR tables, which
  * is what makes the gNB over-allocate UL grants for a UE with no real data. */
@@ -43,9 +44,13 @@ void nr_ue_read_adversary_config(nr_ue_adversary_t *adv)
     INTPARAM(ADV_RACH_PERIOD, "RA re-trigger period in frames when rach_flood is set\n", 0, &adv->rach_period_frames, ADV_DEFAULT_RACH_PERIOD),
     INTPARAM(ADV_START_FRAME, "attack inactive while frame < start_frame\n", 0, &adv->start_frame, 0),
     INTPARAM(ADV_STOP_FRAME, "attack inactive while frame > stop_frame; <=0 means no upper bound\n", 0, &adv->stop_frame, 0),
+    BOOLPARAM(ADV_LOG_GRANTS, "log every UL grant (per-TB RBs/symbols/TBS) instead of only the 128-frame average\n", PARAMFLAG_BOOL, &adv->log_grants, 0),
   };
 
   config_get(config_get_if(), params, sizeofArray(params), ADVERSARY_CONFIG_SECTION);
+
+  if (adv->log_grants)
+    LOG_W(NR_MAC, "[ADVERSARY] per-UL-grant logging ENABLED: expect one line per UL grant (far more frequent than the 128-frame stats)\n");
 
   if (adv->enabled) {
     if (adv->rach_period_frames <= 0)
