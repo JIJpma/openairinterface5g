@@ -2196,6 +2196,45 @@ static void nr_ue_get_sdu_mac_ce_post(NR_UE_MAC_INST_t *mac,
   } else
     LOG_D(NR_MAC, "Can't add any BSR, not enough padding\n");
 
+  /* ──────────────────────────────────────────────────────────────────────
+   * [R-UE] Ground-truth instrumentation for the BSR-inflation experiment.
+   * This is the single point where the UE's TRUE per-LCG buffer (LCG_bytes —
+   * the honest pending bytes) and the BSR level actually EMITTED coexist.
+   * Honest UE: emitted ≈ quantize(true); an inflater's attack patch will make
+   * emitted ≫ true. Keyed by crnti/SFN/slot for offline join with the gNB and
+   * xApp vantages. See "05 research directions/03 ue attacks/03 measurement register.md".
+   * Logging only — no behaviour change.
+   * ────────────────────────────────────────────────────────────────────── */
+  {
+    /* Normalise the emitted BSR to a per-LCG index array, independent of the
+     * short/long encoding, so the offline parser sees one shape. */
+    uint8_t emit_idx[NR_MAX_NUM_LCGID] = {0};
+    if (mac_ce_p->bsr.type_bsr == b_long || mac_ce_p->bsr.type_bsr == b_long_trunc) {
+      for (int lcg_id = 0; lcg_id < NR_MAX_NUM_LCGID; lcg_id++)
+        emit_idx[lcg_id] = mac_ce_p->bsr.bsr.lcg_bsr[lcg_id];
+    } else if (mac_ce_p->bsr.type_bsr == b_short || mac_ce_p->bsr.type_bsr == b_short_trunc) {
+      emit_idx[mac_ce_p->bsr.bsr.s.LcgID] = mac_ce_p->bsr.bsr.s.Buffer_size;
+    }
+    LOG_I(NR_MAC,
+          "[R-UE-BSR] crnti=%04x frame=%d slot=%d bsr_type=%d "
+          "lcg_true_bytes=%u,%u,%u,%u,%u,%u,%u,%u "
+          "lcg_emit_idx=%d,%d,%d,%d,%d,%d,%d,%d\n",
+          mac->crnti, frame, slot, mac_ce_p->bsr.type_bsr,
+          LCG_bytes[0], LCG_bytes[1], LCG_bytes[2], LCG_bytes[3],
+          LCG_bytes[4], LCG_bytes[5], LCG_bytes[6], LCG_bytes[7],
+          emit_idx[0], emit_idx[1], emit_idx[2], emit_idx[3],
+          emit_idx[4], emit_idx[5], emit_idx[6], emit_idx[7]);
+
+    /* Per-LC view: which logical channel feeds which LCG, and its backlog. */
+    for (int i = 0; i < mac->lc_ordered_list.count; i++) {
+      int lcid = mac->lc_ordered_list.array[i]->lcid;
+      NR_LC_SCHEDULING_INFO *lc_sched = get_scheduling_info_from_lcid(mac, lcid);
+      LOG_I(NR_MAC,
+            "[R-UE-LC] crnti=%04x frame=%d slot=%d lcid=%d lcgid=%ld buf_remain=%d\n",
+            mac->crnti, frame, slot, lcid, lc_sched->LCGID, (int)lc_sched->LCID_buffer_remain);
+    }
+  }
+
   /* Actions when a BSR is sent */
   if (mac_ce_p->bsr.type_bsr != b_none) {
     LOG_D(NR_MAC,
