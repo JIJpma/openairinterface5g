@@ -17,6 +17,7 @@
 #include "NR_MAC_COMMON/nr_mac.h"
 #include "NR_MAC_COMMON/nr_mac_common.h"
 #include "NR_MAC_UE/mac_proto.h"
+#include "NR_MAC_UE/nr_ue_adversary.h"
 
 /* utils */
 #include "assertions.h"
@@ -851,6 +852,26 @@ int nr_config_pusch_pdu(NR_UE_MAC_INST_t *mac,
   mac->stats.ul.rb_size += pusch_config_pdu->rb_size;
   mac->stats.ul.nr_of_symbols += pusch_config_pdu->nr_of_symbols;
 
+  // Per-UL-grant trace (opt-in via --adversary.log_grants): the print_ue_mac_stats
+  // line reports rb_size/nr_of_symbols averaged over a 128-frame window, which
+  // hides the instantaneous allocation. This logs the true per-TB values as each
+  // grant is configured, so BSR-inflation effects (grants pinned to the full BWP)
+  // are directly visible. Independent of the attack enable/window on purpose.
+  if (mac->adversary.log_grants)
+    LOG_I(NR_MAC,
+          "UE %d RNTI %04x UL grant per-TB: rb_start %d, nb RBs %d, nb symbols %d, start_symbol %d, "
+          "TBS %d B, mcs %d, round %d, harq pid %d\n",
+          mac->ue_id,
+          mac->crnti,
+          pusch_config_pdu->rb_start,
+          pusch_config_pdu->rb_size,
+          pusch_config_pdu->nr_of_symbols,
+          pusch_config_pdu->start_symbol_index,
+          pusch_config_pdu->pusch_data.tb_size,
+          pusch_config_pdu->mcs_index,
+          mac->ul_harq_info[pid].round,
+          pid);
+
   return 0;
 }
 
@@ -1363,9 +1384,31 @@ void schedule_RA_after_SR_failure(NR_UE_MAC_INST_t *mac)
   // TODO we don't have semi-persistent CSI reporting
 }
 
-static void nr_update_sr(NR_UE_MAC_INST_t *mac, bool BSRsent)
+static void nr_update_sr(NR_UE_MAC_INST_t *mac, frame_t frame, bool BSRsent)
 {
   NR_UE_SCHEDULING_INFO *sched_info = &mac->scheduling_info;
+
+  // ── v1 adversary: SR flood ───────────────────────────────────────────────
+  // Keep a scheduling request permanently pending on the first valid SR
+  // resource, regardless of whether the UE has data, so the gNB keeps issuing
+  // PUCCH-driven UL grants. Bypasses the normal "no data -> cancel SR" logic.
+  if (nr_ue_adversary_active(&mac->adversary, frame) && mac->adversary.sr_flood) {
+    NR_UE_UL_BWP_t *bwp = mac->current_UL_BWP;
+    NR_PUCCH_Config_t *pucch = bwp ? bwp->pucch_Config : NULL;
+    if (pucch && pucch->schedulingRequestResourceToAddModList
+        && pucch->schedulingRequestResourceToAddModList->list.count > 0) {
+      for (int idx = 0; idx < mac->lc_ordered_list.count; idx++) {
+        int sr_id = mac->lc_ordered_list.array[idx]->sr_id;
+        if (sr_id >= 0 && sr_id < NR_MAX_SR_ID && check_pucchres_for_pending_SR(pucch, sr_id)) {
+          nr_sr_info_t *sr = &sched_info->sr_info[sr_id];
+          sr->pending = true;
+          sr->counter = 0;
+          break;
+        }
+      }
+    }
+    return;
+  }
 
   // if no pending data available for transmission
   // All pending SR(s) shall be cancelled and each respective sr-ProhibitTimer shall be stopped
@@ -1484,7 +1527,7 @@ which case the BSR is referred below to as 'Regular BSR';
 
 */
 
-static void nr_update_bsr(NR_UE_MAC_INST_t *mac, uint32_t *LCG_bytes)
+static void nr_update_bsr(NR_UE_MAC_INST_t *mac, frame_t frame, uint32_t *LCG_bytes)
 {
   bool bsr_regular_triggered = mac->scheduling_info.BSR_reporting_active & NR_BSR_TRIGGER_REGULAR;
   for (int i = 0; i < mac->lc_ordered_list.count; i++) {
@@ -1504,6 +1547,31 @@ static void nr_update_bsr(NR_UE_MAC_INST_t *mac, uint32_t *LCG_bytes)
         LOG_D(NR_MAC, "[UE %d] MAC BSR Triggered\n", mac->ue_id);
       }
     }
+  }
+
+  // ── v1 adversary: BSR inflation ──────────────────────────────────────────
+  // Claim a large UL buffer for every LCG the UE uses, so the gNB over-allocates
+  // UL grants. Observable on the E2 MAC SM as an inflated `bsr` and rising
+  // RRU.PrbTotUl for a UE that has little/no real data. The forced regular BSR
+  // makes the inflated report get requested (via SR) and sent even when idle;
+  // pair with sr_flood for a UE with no application traffic at all.
+  if (nr_ue_adversary_active(&mac->adversary, frame) && mac->adversary.bsr_inflate) {
+    const uint32_t claim = (uint32_t)mac->adversary.bsr_min_bytes;
+    int forced_lcid = -1;
+    for (int i = 0; i < mac->lc_ordered_list.count; i++) {
+      nr_lcordered_info_t *lc_info = mac->lc_ordered_list.array[i];
+      if (lc_info->rb_suspended)
+        continue;
+      NR_LC_SCHEDULING_INFO *lc_sched_info = get_scheduling_info_from_lcid(mac, lc_info->lcid);
+      if (lc_sched_info->LCGID == NR_INVALID_LCGID)
+        continue;
+      if (LCG_bytes[lc_sched_info->LCGID] < claim)
+        LCG_bytes[lc_sched_info->LCGID] = claim;
+      if (forced_lcid < 0)
+        forced_lcid = lc_info->lcid;
+    }
+    if (forced_lcid >= 0 && !(mac->scheduling_info.BSR_reporting_active & NR_BSR_TRIGGER_REGULAR))
+      trigger_regular_bsr(mac, forced_lcid, false);
   }
 }
 
@@ -2128,6 +2196,56 @@ static void nr_ue_get_sdu_mac_ce_post(NR_UE_MAC_INST_t *mac,
   } else
     LOG_D(NR_MAC, "Can't add any BSR, not enough padding\n");
 
+  /* ──────────────────────────────────────────────────────────────────────
+   * [R-UE] Ground-truth instrumentation for the BSR-inflation experiment.
+   * Logs, at the single point where they coexist, the UE's TRUE per-LCG
+   * backlog vs the BSR level actually EMITTED. Honest UE: emitted ≈
+   * quantize(true); an inflater makes emitted ≫ true.
+   *
+   * IMPORTANT: the TRUE backlog is taken from LCID_buffer_remain (the honest
+   * RLC residual), NOT from LCG_bytes. The adversary patch in nr_update_bsr()
+   * overwrites LCG_bytes with the inflated claim before we reach here, so
+   * LCG_bytes is the *claim*, not the truth; LCID_buffer_remain is what the
+   * attack never touches. Keyed by crnti/SFN/slot for offline join with the
+   * gNB and xApp vantages. See
+   * "05 research directions/03 ue attacks/03 measurement register.md".
+   * Logging only — no behaviour change.
+   * ────────────────────────────────────────────────────────────────────── */
+  {
+    /* TRUE per-LCG backlog = sum of honest per-LC residuals; and the per-LC
+     * view (which LC feeds which LCG). Attack-independent. */
+    uint32_t true_lcg[NR_MAX_NUM_LCGID] = {0};
+    for (int i = 0; i < mac->lc_ordered_list.count; i++) {
+      int lcid = mac->lc_ordered_list.array[i]->lcid;
+      NR_LC_SCHEDULING_INFO *lc_sched = get_scheduling_info_from_lcid(mac, lcid);
+      if (lc_sched->LCGID != NR_INVALID_LCGID && lc_sched->LCGID < NR_MAX_NUM_LCGID
+          && lc_sched->LCID_buffer_remain > 0)
+        true_lcg[lc_sched->LCGID] += lc_sched->LCID_buffer_remain;
+      LOG_I(NR_MAC,
+            "[R-UE-LC] crnti=%04x frame=%d slot=%d lcid=%d lcgid=%ld buf_remain=%d\n",
+            mac->crnti, frame, slot, lcid, lc_sched->LCGID, (int)lc_sched->LCID_buffer_remain);
+    }
+
+    /* Normalise the emitted BSR to a per-LCG index array, independent of the
+     * short/long encoding, so the offline parser sees one shape. */
+    uint8_t emit_idx[NR_MAX_NUM_LCGID] = {0};
+    if (mac_ce_p->bsr.type_bsr == b_long || mac_ce_p->bsr.type_bsr == b_long_trunc) {
+      for (int lcg_id = 0; lcg_id < NR_MAX_NUM_LCGID; lcg_id++)
+        emit_idx[lcg_id] = mac_ce_p->bsr.bsr.lcg_bsr[lcg_id];
+    } else if (mac_ce_p->bsr.type_bsr == b_short || mac_ce_p->bsr.type_bsr == b_short_trunc) {
+      emit_idx[mac_ce_p->bsr.bsr.s.LcgID] = mac_ce_p->bsr.bsr.s.Buffer_size;
+    }
+    LOG_I(NR_MAC,
+          "[R-UE-BSR] crnti=%04x frame=%d slot=%d bsr_type=%d "
+          "lcg_true_bytes=%u,%u,%u,%u,%u,%u,%u,%u "
+          "lcg_emit_idx=%d,%d,%d,%d,%d,%d,%d,%d\n",
+          mac->crnti, frame, slot, mac_ce_p->bsr.type_bsr,
+          true_lcg[0], true_lcg[1], true_lcg[2], true_lcg[3],
+          true_lcg[4], true_lcg[5], true_lcg[6], true_lcg[7],
+          emit_idx[0], emit_idx[1], emit_idx[2], emit_idx[3],
+          emit_idx[4], emit_idx[5], emit_idx[6], emit_idx[7]);
+  }
+
   /* Actions when a BSR is sent */
   if (mac_ce_p->bsr.type_bsr != b_none) {
     LOG_D(NR_MAC,
@@ -2413,7 +2531,7 @@ static uint8_t nr_ue_get_sdu(NR_UE_MAC_INST_t *mac,
   // Call BSR procedure as described in Section 5.4.5 in 38.321
   // Check whether BSR is triggered before scheduling ULSCH
   uint32_t LCG_bytes[NR_MAX_NUM_LCGID] = {0};
-  nr_update_bsr(mac, LCG_bytes);
+  nr_update_bsr(mac, frame, LCG_bytes);
 
   nr_ue_get_sdu_mac_ce_pre(mac, frame, slot, ulsch_buffer, buflen, LCG_bytes, &mac_ce_info, tx_power, P_CMAX);
 
@@ -2543,6 +2661,17 @@ void nr_ue_ul_scheduler(NR_UE_MAC_INST_t *mac, nr_uplink_indication_t *ul_info)
   slot_t slot_tx = ul_info->slot;
   RA_config_t *ra = &mac->ra;
 
+  // ── v1 adversary: RACH flood ─────────────────────────────────────────────
+  // Periodically force a fresh Random Access procedure while connected, loading
+  // the gNB RA machinery (preamble contention, Msg2/Msg3) for a UE with no
+  // legitimate reason to re-access. Fires once per rach_period_frames.
+  if (nr_ue_adversary_active(&mac->adversary, frame_tx) && mac->adversary.rach_flood
+      && mac->state == UE_CONNECTED && ra->ra_state == nrRA_UE_IDLE && slot_tx == 0
+      && mac->adversary.rach_period_frames > 0 && (frame_tx % mac->adversary.rach_period_frames) == 0) {
+    LOG_W(NR_MAC, "[ADVERSARY][%d.%d] forcing RA procedure (RACH flood)\n", frame_tx, slot_tx);
+    trigger_MAC_UE_RA(mac, NULL);
+  }
+
   if (mac->state == UE_PERFORMING_RA && ra->ra_state == nrRA_UE_IDLE) {
     init_RA(mac);
     // perform the Random Access Resource selection procedure (see clause 5.1.2 and .2a)
@@ -2658,7 +2787,7 @@ void nr_ue_ul_scheduler(NR_UE_MAC_INST_t *mac, nr_uplink_indication_t *ul_info)
   }
 
   if(mac->state == UE_CONNECTED)
-    nr_update_sr(mac, BSRsent);
+    nr_update_sr(mac, frame_tx, BSRsent);
   // Global variables implicit logic
   // far away, BSR_reporting_active is set
   mac->scheduling_info.BSR_reporting_active = NR_BSR_TRIGGER_NONE;
