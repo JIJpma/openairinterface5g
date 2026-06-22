@@ -2198,14 +2198,34 @@ static void nr_ue_get_sdu_mac_ce_post(NR_UE_MAC_INST_t *mac,
 
   /* ──────────────────────────────────────────────────────────────────────
    * [R-UE] Ground-truth instrumentation for the BSR-inflation experiment.
-   * This is the single point where the UE's TRUE per-LCG buffer (LCG_bytes —
-   * the honest pending bytes) and the BSR level actually EMITTED coexist.
-   * Honest UE: emitted ≈ quantize(true); an inflater's attack patch will make
-   * emitted ≫ true. Keyed by crnti/SFN/slot for offline join with the gNB and
-   * xApp vantages. See "05 research directions/03 ue attacks/03 measurement register.md".
+   * Logs, at the single point where they coexist, the UE's TRUE per-LCG
+   * backlog vs the BSR level actually EMITTED. Honest UE: emitted ≈
+   * quantize(true); an inflater makes emitted ≫ true.
+   *
+   * IMPORTANT: the TRUE backlog is taken from LCID_buffer_remain (the honest
+   * RLC residual), NOT from LCG_bytes. The adversary patch in nr_update_bsr()
+   * overwrites LCG_bytes with the inflated claim before we reach here, so
+   * LCG_bytes is the *claim*, not the truth; LCID_buffer_remain is what the
+   * attack never touches. Keyed by crnti/SFN/slot for offline join with the
+   * gNB and xApp vantages. See
+   * "05 research directions/03 ue attacks/03 measurement register.md".
    * Logging only — no behaviour change.
    * ────────────────────────────────────────────────────────────────────── */
   {
+    /* TRUE per-LCG backlog = sum of honest per-LC residuals; and the per-LC
+     * view (which LC feeds which LCG). Attack-independent. */
+    uint32_t true_lcg[NR_MAX_NUM_LCGID] = {0};
+    for (int i = 0; i < mac->lc_ordered_list.count; i++) {
+      int lcid = mac->lc_ordered_list.array[i]->lcid;
+      NR_LC_SCHEDULING_INFO *lc_sched = get_scheduling_info_from_lcid(mac, lcid);
+      if (lc_sched->LCGID != NR_INVALID_LCGID && lc_sched->LCGID < NR_MAX_NUM_LCGID
+          && lc_sched->LCID_buffer_remain > 0)
+        true_lcg[lc_sched->LCGID] += lc_sched->LCID_buffer_remain;
+      LOG_I(NR_MAC,
+            "[R-UE-LC] crnti=%04x frame=%d slot=%d lcid=%d lcgid=%ld buf_remain=%d\n",
+            mac->crnti, frame, slot, lcid, lc_sched->LCGID, (int)lc_sched->LCID_buffer_remain);
+    }
+
     /* Normalise the emitted BSR to a per-LCG index array, independent of the
      * short/long encoding, so the offline parser sees one shape. */
     uint8_t emit_idx[NR_MAX_NUM_LCGID] = {0};
@@ -2220,19 +2240,10 @@ static void nr_ue_get_sdu_mac_ce_post(NR_UE_MAC_INST_t *mac,
           "lcg_true_bytes=%u,%u,%u,%u,%u,%u,%u,%u "
           "lcg_emit_idx=%d,%d,%d,%d,%d,%d,%d,%d\n",
           mac->crnti, frame, slot, mac_ce_p->bsr.type_bsr,
-          LCG_bytes[0], LCG_bytes[1], LCG_bytes[2], LCG_bytes[3],
-          LCG_bytes[4], LCG_bytes[5], LCG_bytes[6], LCG_bytes[7],
+          true_lcg[0], true_lcg[1], true_lcg[2], true_lcg[3],
+          true_lcg[4], true_lcg[5], true_lcg[6], true_lcg[7],
           emit_idx[0], emit_idx[1], emit_idx[2], emit_idx[3],
           emit_idx[4], emit_idx[5], emit_idx[6], emit_idx[7]);
-
-    /* Per-LC view: which logical channel feeds which LCG, and its backlog. */
-    for (int i = 0; i < mac->lc_ordered_list.count; i++) {
-      int lcid = mac->lc_ordered_list.array[i]->lcid;
-      NR_LC_SCHEDULING_INFO *lc_sched = get_scheduling_info_from_lcid(mac, lcid);
-      LOG_I(NR_MAC,
-            "[R-UE-LC] crnti=%04x frame=%d slot=%d lcid=%d lcgid=%ld buf_remain=%d\n",
-            mac->crnti, frame, slot, lcid, lc_sched->LCGID, (int)lc_sched->LCID_buffer_remain);
-    }
   }
 
   /* Actions when a BSR is sent */
